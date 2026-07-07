@@ -8,20 +8,63 @@ echo "▶ 准备虚拟环境…"
 if [ ! -d venv ]; then
   python3 -m venv venv
 fi
-source venv/bin/activate
+# 正常 venv 有 activate；conda 建的残缺 venv 没有，则直接用 venv 里的 python
+if [ -f venv/bin/activate ]; then
+  source venv/bin/activate
+  PY=python
+else
+  echo "  （venv 无 activate，改用 venv/bin/python 直接调用）"
+  PY=venv/bin/python
+fi
 
-echo "▶ 安装依赖（PySide6 + py2app）…"
-pip install --upgrade pip >/dev/null
-pip install PySide6 py2app >/dev/null
+echo "▶ 安装依赖（PySide6-Essentials 更小 + py2app）…"
+"$PY" -m pip install --upgrade pip >/dev/null
+"$PY" -m pip install PySide6-Essentials py2app setuptools >/dev/null
 
 echo "▶ 先确认能正常启动（3 秒后自动关）…"
-( python laterqueue.py & PID=$!; sleep 3; kill $PID 2>/dev/null ) || true
+( "$PY" laterqueue.py & PID=$!; sleep 3; kill $PID 2>/dev/null ) || true
 
 echo "▶ 清理旧产物并打包…"
-rm -rf build dist
-python setup.py py2app
+# Finder 若开着 dist/ 会瞬时锁目录，导致 rm 偶发 EACCES；重试几次并容错
+for d in build dist; do
+  [ -e "$d" ] || continue
+  rm -rf "$d" 2>/dev/null || { sleep 1; rm -rf "$d" 2>/dev/null; } || \
+    chmod -R u+w "$d" 2>/dev/null && rm -rf "$d" 2>/dev/null || true
+done
+"$PY" setup.py py2app
+
+echo "▶ 精简 bundle（删掉 py2app 强塞进来、本程序用不到的 Qt 组件）…"
+SP=$(command find dist/LaterQueue.app/Contents/Resources/lib -maxdepth 2 -type d -name PySide6 | head -1)
+if [ -n "$SP" ]; then
+  # 整块用不到的目录：QML 运行时、翻译、示例、开发工具
+  rm -rf "$SP/Qt/qml" "$SP/Qt/translations" "$SP/Qt/libexec" \
+         "$SP/examples" "$SP/glue" "$SP/typesystems" \
+         "$SP/Assistant.app" "$SP/Designer.app" "$SP/Linguist.app"
+  rm -f "$SP/lupdate" "$SP/lrelease" "$SP/uic" "$SP/rcc" \
+        "$SP/qmlformat" "$SP/qmllint" "$SP/qmlls"
+  # 用不到的插件（保留 platforms/imageformats/styles/iconengines/tls）
+  rm -rf "$SP/Qt/plugins/sqldrivers" "$SP/Qt/plugins/qmltooling" \
+         "$SP/Qt/plugins/qmllint" "$SP/Qt/plugins/designer" \
+         "$SP/Qt/plugins/generic" "$SP/Qt/plugins/networkinformation" \
+         "$SP/Qt/plugins/vectorimageformats"
+  # 用不到的 framework 和 .abi3.so（本程序只用 QtCore/QtGui/QtWidgets/QtDBus）
+  for fw in QtQuick QtQml QtDesigner QtDesignerComponents QtQmlCompiler \
+            QtQuickControls2Basic QtQuickControls2Fusion QtQuickControls2 \
+            QtLabsStyleKit QtQmlModels QtOpenGL QtHelp QtPrintSupport QtLottie \
+            QtLabsPlatform QtLabsStyleKitImpl QtQuickControls2FluentWinUI3StyleImpl \
+            QtLottieVectorImageGenerator QtLabsQmlModels QtQuickControls2FusionStyleImpl \
+            QtQmlMeta QtQmlXmlListModel QtQmlNetwork QtQmlCore QtLabsFolderListModel \
+            QtQuickControls2BasicStyleImpl QtOpenGLWidgets QtQmlWorkerScript \
+            QtQmlLocalStorage QtLabsSharedImage QtLabsAnimation QtLabsWavefrontMesh \
+            QtLabsSynchronizer QtLottieVectorImageHelpers QtLabsSettings QtConcurrent \
+            QtSql QtTest QtQuickWidgets QtUiTools QtQuick3D; do
+    rm -rf "$SP/Qt/lib/$fw.framework"
+    rm -f "$SP/$fw.abi3.so" "$SP/$fw.pyi"
+  done
+  echo "   精简后大小：$(du -sh dist/LaterQueue.app | cut -f1)"
+fi
 
 echo ""
 echo "✅ 完成！应用在 dist/LaterQueue.app"
 echo "   把它拖进「应用程序」即可。首次打开若提示身份不明，右键 → 打开。"
-open dist/ 2>/dev/null || true
+echo "   （在 Finder 中查看：open dist/）"

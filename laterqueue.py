@@ -14,6 +14,8 @@ import os
 import sys
 import json
 import uuid
+import math
+import random
 import traceback
 import subprocess
 from datetime import datetime
@@ -37,7 +39,14 @@ LAUNCH_AGENT_PATH = os.path.expanduser(
     f"~/Library/LaunchAgents/{LAUNCH_AGENT_LABEL}.plist")
 ASSET_PET = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                          "assets", "pet.png")
+ASSET_PET_BLINK = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "assets", "pet_blink.png")
 PET_WIDTH = 130   # 桌面上小精灵显示宽度（px）
+
+# 动画参数
+FLOAT_AMP = 6      # 待机上下浮动幅度（px）
+HOVER_SCALE = 1.08  # 悬停放大倍数
+JUMP_AMP = 14      # 点击跳动幅度（px）
 
 
 def _ensure_dir():
@@ -271,14 +280,29 @@ class Pet(QWidget):
         except Exception:
             pass
 
-        # 小精灵图片
+        # 小精灵图片：预加载睁眼/闭眼两帧
+        self._pix_open = QPixmap(ASSET_PET)
+        if not self._pix_open.isNull():
+            self._pix_open = self._pix_open.scaledToWidth(
+                PET_WIDTH, Qt.SmoothTransformation)
+        self._pix_blink = QPixmap(ASSET_PET_BLINK)
+        if not self._pix_blink.isNull():
+            self._pix_blink = self._pix_blink.scaledToWidth(
+                PET_WIDTH, Qt.SmoothTransformation)
+
+        self._pet_size = (self._pix_open.size() if not self._pix_open.isNull()
+                          else QSize(PET_WIDTH, 150))
+
+        # 窗口比图片四周各留 MARGIN，供浮动/放大/跳动时溢出，不移动窗口本身
+        pw, ph = self._pet_size.width(), self._pet_size.height()
+        extra = int(pw * (HOVER_SCALE - 1)) + JUMP_AMP + FLOAT_AMP + 8
+        self._margin = extra
+        self.resize(pw + extra * 2, ph + extra * 2)
+
         self.label = QLabel(self)
-        pix = QPixmap(ASSET_PET)
-        if not pix.isNull():
-            pix = pix.scaledToWidth(PET_WIDTH, Qt.SmoothTransformation)
-        self.label.setPixmap(pix)
+        self.label.setScaledContents(True)
+        self.label.setPixmap(self._pix_open)
         self.label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        self.resize(pix.size() if not pix.isNull() else QSize(PET_WIDTH, 150))
 
         # 待办计数小气泡（叠在右上角）
         self.badge = QLabel(self)
@@ -297,8 +321,80 @@ class Pet(QWidget):
         self._press_pos = None
         self._moved = False
 
+        # ---------- 动画状态 ----------
+        self._t = 0.0            # 动画时钟（秒）
+        self._scale = 1.0        # 当前缩放
+        self._scale_target = 1.0  # 目标缩放（悬停切换）
+        self._jump = 0.0         # 当前跳动偏移（衰减振荡）
+        self._blinking = False
+
+        self._anim = QTimer(self)
+        self._anim.timeout.connect(self._tick)
+        self._anim.start(33)     # ~30fps
+
+        self._blink_timer = QTimer(self)
+        self._blink_timer.setSingleShot(True)
+        self._blink_timer.timeout.connect(self._do_blink)
+        self._schedule_blink()
+
+        self.setMouseTracking(True)
+        self._layout_pet()
+
         self._restore_position()
         self.update_badge()
+
+    # ---------- 动画 ----------
+    def _layout_pet(self):
+        """按当前浮动/缩放/跳动，把 label 摆到窗口内正确位置（不移动窗口）。"""
+        pw, ph = self._pet_size.width(), self._pet_size.height()
+        sw, sh = int(pw * self._scale), int(ph * self._scale)
+        float_y = math.sin(self._t * 2.0) * FLOAT_AMP   # 缓慢上下浮动
+        cx = self.width() // 2
+        cy = self.height() // 2
+        x = cx - sw // 2
+        y = cy - sh // 2 + int(float_y) - int(self._jump)
+        self.label.setGeometry(x, y, sw, sh)
+        # badge 跟着小人右上角走
+        self.badge.move(x + sw - 20, y + 2)
+        if self.badge.isVisible():
+            self.badge.raise_()
+
+    def _tick(self):
+        self._t += 0.033
+        # 悬停缩放：向目标平滑插值
+        self._scale += (self._scale_target - self._scale) * 0.25
+        # 点击跳动：衰减
+        if abs(self._jump) > 0.5:
+            self._jump *= 0.82
+        else:
+            self._jump = 0.0
+        self._layout_pet()
+
+    def _schedule_blink(self):
+        self._blink_timer.start(random.randint(2500, 6000))
+
+    def _do_blink(self):
+        if self._pix_blink.isNull():
+            self._schedule_blink()
+            return
+        self.label.setPixmap(self._pix_blink)
+        QTimer.singleShot(140, self._end_blink)
+
+    def _end_blink(self):
+        self.label.setPixmap(self._pix_open)
+        self._schedule_blink()
+
+    def enterEvent(self, e):
+        self._scale_target = HOVER_SCALE   # 悬停放大
+        super().enterEvent(e)
+
+    def leaveEvent(self, e):
+        self._scale_target = 1.0
+        super().leaveEvent(e)
+
+    def _bounce(self):
+        """点击/新增任务时跳一下。"""
+        self._jump = JUMP_AMP
 
     # ---------- 菜单 ----------
     def _build_menu(self):
@@ -336,6 +432,7 @@ class Pet(QWidget):
         if ok and text.strip():
             self.items.insert(0, new_item(text.strip()))
             save_items(self.items)
+            self._bounce()         # 新增任务，开心跳一下
             self.refresh_ui()
             if not self.bubble.isVisible():
                 self.toggle_bubble()
@@ -381,9 +478,8 @@ class Pet(QWidget):
         n = len(self.pending())
         if n > 0:
             self.badge.setText(str(n) if n < 100 else "99+")
-            self.badge.move(self.width() - 26, 4)
             self.badge.show()
-            self.badge.raise_()
+            self.badge.raise_()   # 位置由 _layout_pet 每帧跟随小人更新
         else:
             self.badge.hide()
 
@@ -399,14 +495,17 @@ class Pet(QWidget):
 
     def _place_bubble(self):
         # 放在小精灵上方；若上方空间不够则放下方
+        # 窗口四周有透明 margin，小人图在窗口中心，故按小人视觉区域定位
         self.bubble.adjustSize()
         bw, bh = self.bubble.width(), self.bubble.height()
         g = self.frameGeometry()
+        pet_top = g.center().y() - self._pet_size.height() // 2
+        pet_bottom = g.center().y() + self._pet_size.height() // 2
         x = g.center().x() - bw // 2
-        y = g.top() - bh + 10
+        y = pet_top - bh + 10
         screen = QApplication.primaryScreen().availableGeometry()
         if y < screen.top():
-            y = g.bottom() - 10
+            y = pet_bottom - 10
         x = max(screen.left() + 4, min(x, screen.right() - bw - 4))
         self.bubble.move(x, y)
 
@@ -450,6 +549,7 @@ class Pet(QWidget):
     def mouseReleaseEvent(self, e):
         if e.button() == Qt.LeftButton and getattr(self, "_click_candidate", False):
             self._click_candidate = False
+            self._bounce()         # 点一下先跳一下
             self.toggle_bubble()   # 没拖动 = 单击，展开/收起队列
 
     def moveEvent(self, e):

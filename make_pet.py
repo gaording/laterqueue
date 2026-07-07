@@ -4,7 +4,7 @@ SS = 3          # 超采样，边缘更平滑
 OUT = 2         # 输出放大（更清晰）
 W, H = 400, 480
 
-def render(path):
+def render(path, blink=False):
     img = Image.new("RGBA", (W*SS, H*SS), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
     def S(v): return v*SS
@@ -12,6 +12,7 @@ def render(path):
     def ell(x0, y0, x1, y1, **k): d.ellipse(box(x0, y0, x1, y1), **k)
     def poly(pts, **k): d.polygon([(S(x), S(y)) for x, y in pts], **k)
     def line(pts, fill, width): d.line([(S(x), S(y)) for x, y in pts], fill=fill, width=int(S(width)))
+    def arc(x0, y0, x1, y1, start, end, fill, width): d.arc(box(x0, y0, x1, y1), start, end, fill=fill, width=int(S(width)))
 
     BODY=(175,201,222,255); BODYO=(120,155,190,255)
     CREAM=(246,238,223,255); WOOD=(176,132,80,255); SAND=(232,163,60,255)
@@ -34,12 +35,18 @@ def render(path):
     poly([(180,285),(220,285),(208,306),(192,306)],fill=SAND)
     line([(cx,neck),(cx,372)],SAND,3)
     poly([(178,377),(222,377),(cx,353)],fill=SAND)
-    ell(150,198,186,246,fill=DARK)
-    ell(214,198,250,246,fill=DARK)
-    ell(158,206,172,222,fill=WHITE)
-    ell(222,206,236,222,fill=WHITE)
     ell(118,232,150,254,fill=CHEEK)
     ell(250,232,282,254,fill=CHEEK)
+    if blink:
+        # 闭眼：向下弯的笑眼弧线（配合腮红，像开心眯眼）
+        arc(150,206,186,240,200,340,DARK,4)
+        arc(214,206,250,240,200,340,DARK,4)
+    else:
+        # 睁眼：黑椭圆 + 高光
+        ell(150,198,186,246,fill=DARK)
+        ell(214,198,250,246,fill=DARK)
+        ell(158,206,172,222,fill=WHITE)
+        ell(222,206,236,222,fill=WHITE)
     d.arc(box(186,236,214,260),20,160,fill=DARK,width=S(3))
 
     img.resize((W*OUT, H*OUT), Image.LANCZOS).save(path)
@@ -47,4 +54,6 @@ def render(path):
 
 if __name__ == "__main__":
     import os
-    render(os.path.join(os.path.dirname(__file__), "assets", "pet.png"))
+    here = os.path.dirname(__file__)
+    render(os.path.join(here, "assets", "pet.png"))
+    render(os.path.join(here, "assets", "pet_blink.png"), blink=True)

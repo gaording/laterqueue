@@ -11,13 +11,30 @@ py2app 打包脚本 —— 在 Mac 上把桌宠打成可双击运行的 .app
 from setuptools import setup
 
 APP = ["laterqueue.py"]
-DATA_FILES = [("assets", ["assets/pet.png"])]   # 打包时带上小精灵图片
+DATA_FILES = [("assets", ["assets/pet.png", "assets/pet_blink.png"])]   # 打包时带上小精灵两帧
 
 OPTIONS = {
     "argv_emulation": False,          # 新系统上开启常出问题，保持关闭
     "iconfile": "assets/AppIcon.icns",
-    "packages": ["PySide6", "shiboken6"],
+    "packages": ["shiboken6"],
+    # 只用到这三个 Qt 模块，其余不打包，大幅减小体积
     "includes": ["PySide6.QtCore", "PySide6.QtGui", "PySide6.QtWidgets"],
+    "excludes": [
+        # 用不到的重型 Qt 模块（QtWebEngine 单独就几百 MB）
+        "PySide6.QtWebEngineCore", "PySide6.QtWebEngineWidgets",
+        "PySide6.QtWebEngineQuick", "PySide6.QtQml", "PySide6.QtQuick",
+        "PySide6.QtQuick3D", "PySide6.QtQuickWidgets",
+        "PySide6.Qt3DCore", "PySide6.Qt3DRender", "PySide6.Qt3DExtras",
+        "PySide6.QtMultimedia", "PySide6.QtMultimediaWidgets",
+        "PySide6.QtCharts", "PySide6.QtDataVisualization",
+        "PySide6.QtPdf", "PySide6.QtPdfWidgets", "PySide6.QtDesigner",
+        "PySide6.QtSql", "PySide6.QtTest", "PySide6.QtBluetooth",
+        "PySide6.QtPositioning", "PySide6.QtSensors", "PySide6.QtSerialPort",
+        "PySide6.QtWebSockets", "PySide6.QtNetworkAuth", "PySide6.QtOpenGL",
+        "PySide6.QtOpenGLWidgets", "PySide6.QtWebChannel",
+        # 无关的标准库
+        "tkinter", "test", "unittest", "pydoc_data",
+    ],
     "plist": {
         "CFBundleName": "LaterQueue",
         "CFBundleDisplayName": "晚点队列",
