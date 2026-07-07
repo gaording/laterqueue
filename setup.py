@@ -15,7 +15,9 @@ DATA_FILES = [("assets", ["assets/pet.png"])]   # 打包时带上小精灵图片
 
 OPTIONS = {
     "argv_emulation": False,          # 新系统上开启常出问题，保持关闭
+    "iconfile": "assets/AppIcon.icns",
     "packages": ["PySide6", "shiboken6"],
+    "includes": ["PySide6.QtCore", "PySide6.QtGui", "PySide6.QtWidgets"],
     "plist": {
         "CFBundleName": "LaterQueue",
         "CFBundleDisplayName": "晚点队列",
