@@ -20,8 +20,9 @@ import traceback
 import subprocess
 from datetime import datetime
 
-from PySide6.QtCore import Qt, QPoint, QSize, QTimer
-from PySide6.QtGui import QPixmap, QAction, QFont, QColor, QGuiApplication
+from PySide6.QtCore import Qt, QPoint, QSize, QTimer, QRectF
+from PySide6.QtGui import (
+    QPixmap, QImage, QAction, QFont, QColor, QGuiApplication, QPainter, QBrush)
 from PySide6.QtWidgets import (
     QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout, QPushButton,
     QMenu, QInputDialog, QScrollArea, QGraphicsDropShadowEffect, QSizePolicy,
@@ -272,8 +273,12 @@ class Pet(QWidget):
         super().__init__()
         self.items = load_items()
 
+        # NoDropShadowWindowHint 是关键：半透明窗口在 macOS 上会由合成器按窗口
+        # alpha 蒙版生成投影，软边缘处渲染成一圈浅色 halo（跳动/放大时最明显），
+        # 徽标那团独立色块还会投出一个单独的浅色圆圈。关掉窗口投影即彻底消除。
         self.setWindowFlags(
-            Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+            Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
+            | Qt.NoDropShadowWindowHint)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         try:
             self.setAttribute(Qt.WA_MacAlwaysShowToolWindow, True)
@@ -301,20 +306,15 @@ class Pet(QWidget):
         self._margin = extra
         self.resize(pw + extra * 2, ph + extra * 2)
 
-        self.label = QLabel(self)
-        self.label.setScaledContents(True)
-        self.label.setPixmap(self._pix_open)
-        self.label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        # 小精灵由 paintEvent 直接绘制（见 _pet_rect / paintEvent），不用 QLabel。
+        # 全自绘让缩放/浮动/跳动都在同一层做正确的 alpha 合成，几何最干净；
+        # 徽标也画在同层（见下）。（白色 halo 的真正成因是窗口投影，已由
+        # NoDropShadowWindowHint 解决，见上方 setWindowFlags。）
+        self._pet_rect = QRectF()   # 当前帧小人绘制矩形（逻辑坐标）
 
-        # 待办计数小气泡（叠在右上角）
-        self.badge = QLabel(self)
-        self.badge.setAlignment(Qt.AlignCenter)
-        self.badge.setStyleSheet("""
-            background:#e8574c; color:white; border-radius:11px;
-            font-size:12px; font-weight:700;""")
-        self.badge.setFixedSize(22, 22)
-        self.badge.setAttribute(Qt.WA_TransparentForMouseEvents, True)  # 不挡拖动
-        self.badge.hide()
+        # 待办计数（画在 paintEvent 里，不用 QLabel）：与小人同层绘制，
+        # 避免独立子控件带来额外的合成层与几何错位。
+        self._badge_count = 0
 
         self.bubble = QueueBubble(self)
         self.bubble.hide()
@@ -349,28 +349,54 @@ class Pet(QWidget):
     def _load_pet_pixmap(self, path, dpr):
         """按屏幕 dpr 缩放到物理像素，并标记 devicePixelRatio。
         逻辑显示宽仍是 PET_WIDTH，但位图分辨率吃满 Retina，避免边缘 halo。"""
-        pm = QPixmap(path)
-        if pm.isNull():
-            return pm
-        pm = pm.scaledToWidth(
+        img = QImage(path)
+        if img.isNull():
+            return QPixmap()
+        # 预乘 alpha：与半透明窗口合成路径一致，缩放插值时边缘更干净。
+        img = img.convertToFormat(QImage.Format_ARGB32_Premultiplied)
+        img = img.scaledToWidth(
             int(round(PET_WIDTH * dpr)), Qt.SmoothTransformation)
+        pm = QPixmap.fromImage(img)
         pm.setDevicePixelRatio(dpr)
         return pm
 
     def _layout_pet(self):
-        """按当前浮动/缩放/跳动，把 label 摆到窗口内正确位置（不移动窗口）。"""
+        """按当前浮动/缩放/跳动，算出小人绘制矩形，然后触发重绘。"""
         pw, ph = self._pet_size.width(), self._pet_size.height()
-        sw, sh = int(pw * self._scale), int(ph * self._scale)
-        float_y = math.sin(self._t * 2.0) * FLOAT_AMP   # 缓慢上下浮动
-        cx = self.width() // 2
-        cy = self.height() // 2
-        x = cx - sw // 2
-        y = cy - sh // 2 + int(float_y) - int(self._jump)
-        self.label.setGeometry(x, y, sw, sh)
-        # badge 跟着小人右上角走
-        self.badge.move(x + sw - 20, y + 2)
-        if self.badge.isVisible():
-            self.badge.raise_()
+        sw, sh = pw * self._scale, ph * self._scale   # 用浮点，避免取整错位
+        float_y = math.sin(self._t * 2.0) * FLOAT_AMP
+        cx = self.width() / 2.0
+        cy = self.height() / 2.0
+        x = cx - sw / 2.0
+        y = cy - sh / 2.0 + float_y - self._jump
+        self._pet_rect = QRectF(x, y, sw, sh)
+        self.update()   # 请求重绘
+
+    def paintEvent(self, e):
+        pm = self._pix_blink if self._blinking else self._pix_open
+        if pm is None or pm.isNull() or self._pet_rect.isEmpty():
+            return
+        p = QPainter(self)
+        # 平滑变换 + 高质量抗锯齿，让 Qt 一次性正确合成 alpha 边缘（无 halo）
+        p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        # 源矩形用整张高分位图；目标矩形是浮点，drawPixmap 内部按 dpr 缩放
+        p.drawPixmap(self._pet_rect, pm, QRectF(pm.rect()))
+        # 待办计数气泡：画在小人右上角（同层绘制，无子控件 halo）
+        if self._badge_count > 0:
+            r = self._pet_rect
+            d = 22.0
+            bx = r.x() + r.width() - 24
+            by = r.y() + 2
+            p.setPen(Qt.NoPen)
+            p.setBrush(QBrush(QColor("#e8574c")))
+            p.drawEllipse(QRectF(bx, by, d, d))
+            p.setPen(QColor("white"))
+            f = QFont(); f.setPixelSize(12); f.setBold(True)
+            p.setFont(f)
+            txt = str(self._badge_count) if self._badge_count < 100 else "99+"
+            p.drawText(QRectF(bx, by, d, d), Qt.AlignCenter, txt)
+        p.end()
 
     def _tick(self):
         self._t += 0.033
@@ -390,11 +416,11 @@ class Pet(QWidget):
         if self._pix_blink.isNull():
             self._schedule_blink()
             return
-        self.label.setPixmap(self._pix_blink)
+        self._blinking = True
         QTimer.singleShot(140, self._end_blink)
 
     def _end_blink(self):
-        self.label.setPixmap(self._pix_open)
+        self._blinking = False
         self._schedule_blink()
 
     def enterEvent(self, e):
@@ -488,13 +514,8 @@ class Pet(QWidget):
         self.update_badge()
 
     def update_badge(self):
-        n = len(self.pending())
-        if n > 0:
-            self.badge.setText(str(n) if n < 100 else "99+")
-            self.badge.show()
-            self.badge.raise_()   # 位置由 _layout_pet 每帧跟随小人更新
-        else:
-            self.badge.hide()
+        self._badge_count = len(self.pending())
+        self.update()
 
     # ---------- 气泡显隐与定位 ----------
     def toggle_bubble(self):
