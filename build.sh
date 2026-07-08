@@ -64,6 +64,32 @@ if [ -n "$SP" ]; then
   echo "   精简后大小：$(du -sh dist/LaterQueue.app | cut -f1)"
 fi
 
+echo "▶ 补齐缺失的基础依赖库…"
+# conda 的 Python 把 libffi/libssl/libz 等放在 base/lib，py2app 用 @rpath 引用却常漏收，
+# 导致启动时 dlopen 失败。这里扫描缺失的 @rpath 依赖并从解释器的 lib 目录补进来。
+RESLIB="dist/LaterQueue.app/Contents/Resources/lib"
+FW="dist/LaterQueue.app/Contents/Frameworks"
+PYLIB=$("$PY" -c 'import sys,os;print(os.path.join(sys.base_prefix,"lib"))' 2>/dev/null)
+if [ -d "$RESLIB" ] && [ -d "$PYLIB" ]; then
+  added=0
+  # 反复扫描：新补进来的库可能又引入新的 @rpath 依赖，直到不再增长
+  while : ; do
+    round=0
+    for so in $(command find "$RESLIB" -name "*.so" -o -name "*.dylib" 2>/dev/null); do
+      for dep in $(otool -L "$so" 2>/dev/null | awk '/@rpath/{print $1}'); do
+        base=$(basename "$dep")
+        { [ -f "$RESLIB/$base" ] || [ -f "$FW/$base" ]; } && continue
+        src=$(command find "$PYLIB" -maxdepth 1 -name "$base" 2>/dev/null | head -1)
+        if [ -n "$src" ]; then
+          cp -L "$src" "$RESLIB/$base" && added=$((added+1)) && round=$((round+1))
+        fi
+      done
+    done
+    [ "$round" -eq 0 ] && break
+  done
+  echo "   补入 $added 个依赖库（大小：$(du -sh dist/LaterQueue.app | cut -f1)）"
+fi
+
 echo ""
 echo "✅ 完成！应用在 dist/LaterQueue.app"
 echo "   把它拖进「应用程序」即可。首次打开若提示身份不明，右键 → 打开。"

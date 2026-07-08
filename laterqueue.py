@@ -21,7 +21,7 @@ import subprocess
 from datetime import datetime
 
 from PySide6.QtCore import Qt, QPoint, QSize, QTimer
-from PySide6.QtGui import QPixmap, QAction, QFont, QColor
+from PySide6.QtGui import QPixmap, QAction, QFont, QColor, QGuiApplication
 from PySide6.QtWidgets import (
     QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout, QPushButton,
     QMenu, QInputDialog, QScrollArea, QGraphicsDropShadowEffect, QSizePolicy,
@@ -280,18 +280,20 @@ class Pet(QWidget):
         except Exception:
             pass
 
-        # 小精灵图片：预加载睁眼/闭眼两帧
-        self._pix_open = QPixmap(ASSET_PET)
-        if not self._pix_open.isNull():
-            self._pix_open = self._pix_open.scaledToWidth(
-                PET_WIDTH, Qt.SmoothTransformation)
-        self._pix_blink = QPixmap(ASSET_PET_BLINK)
-        if not self._pix_blink.isNull():
-            self._pix_blink = self._pix_blink.scaledToWidth(
-                PET_WIDTH, Qt.SmoothTransformation)
+        # 小精灵图片：预加载睁眼/闭眼两帧。
+        # Retina 屏(dpr=2)下必须缩放到「物理像素」再标记 devicePixelRatio，
+        # 否则系统会把 dpr=1 的位图二次放大，半透明边缘插值出白色 halo（白底假象）。
+        dpr = self.screen().devicePixelRatio() if self.screen() \
+            else QGuiApplication.primaryScreen().devicePixelRatio()
+        self._pix_open = self._load_pet_pixmap(ASSET_PET, dpr)
+        self._pix_blink = self._load_pet_pixmap(ASSET_PET_BLINK, dpr)
 
-        self._pet_size = (self._pix_open.size() if not self._pix_open.isNull()
-                          else QSize(PET_WIDTH, 150))
+        # devicePixelRatio 已写进 pixmap，逻辑尺寸 = 物理像素 / dpr
+        if not self._pix_open.isNull():
+            s = self._pix_open.deviceIndependentSize()
+            self._pet_size = QSize(round(s.width()), round(s.height()))
+        else:
+            self._pet_size = QSize(PET_WIDTH, 150)
 
         # 窗口比图片四周各留 MARGIN，供浮动/放大/跳动时溢出，不移动窗口本身
         pw, ph = self._pet_size.width(), self._pet_size.height()
@@ -344,6 +346,17 @@ class Pet(QWidget):
         self.update_badge()
 
     # ---------- 动画 ----------
+    def _load_pet_pixmap(self, path, dpr):
+        """按屏幕 dpr 缩放到物理像素，并标记 devicePixelRatio。
+        逻辑显示宽仍是 PET_WIDTH，但位图分辨率吃满 Retina，避免边缘 halo。"""
+        pm = QPixmap(path)
+        if pm.isNull():
+            return pm
+        pm = pm.scaledToWidth(
+            int(round(PET_WIDTH * dpr)), Qt.SmoothTransformation)
+        pm.setDevicePixelRatio(dpr)
+        return pm
+
     def _layout_pet(self):
         """按当前浮动/缩放/跳动，把 label 摆到窗口内正确位置（不移动窗口）。"""
         pw, ph = self._pet_size.width(), self._pet_size.height()
