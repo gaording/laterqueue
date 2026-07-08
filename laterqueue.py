@@ -20,9 +20,10 @@ import traceback
 import subprocess
 from datetime import datetime
 
-from PySide6.QtCore import Qt, QPoint, QSize, QTimer, QRectF
+from PySide6.QtCore import Qt, QPoint, QPointF, QSize, QTimer, QRectF
 from PySide6.QtGui import (
-    QPixmap, QImage, QAction, QFont, QColor, QGuiApplication, QPainter, QBrush)
+    QPixmap, QImage, QAction, QFont, QColor, QGuiApplication, QPainter,
+    QBrush, QPen, QPolygonF)
 from PySide6.QtWidgets import (
     QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout, QPushButton,
     QMenu, QInputDialog, QScrollArea, QGraphicsDropShadowEffect, QSizePolicy,
@@ -48,6 +49,8 @@ PET_WIDTH = 130   # 桌面上小精灵显示宽度（px）
 FLOAT_AMP = 6      # 待机上下浮动幅度（px）
 HOVER_SCALE = 1.08  # 悬停放大倍数
 JUMP_AMP = 14      # 点击跳动幅度（px）
+HG_DRAIN_DUR = 1.1  # 悬停后沙子漏下去的时长（秒）
+HG_FLIP_DUR = 0.5   # 漏完后沙漏翻转 180° 的时长（秒）
 
 
 def _ensure_dir():
@@ -197,12 +200,12 @@ class QueueBubble(QWidget):
 
         # 头部
         head = QHBoxLayout()
-        title = QLabel("晚点队列")
+        title = QLabel("稍后处理")
         title.setObjectName("title")
         title.setFont(QFont("", 14))
         head.addWidget(title)
         head.addStretch(1)
-        cnt = QLabel(f"欠着 {len(pending)} 件" if pending else "清空啦～")
+        cnt = QLabel(f"待处理 {len(pending)} 件" if pending else "清空啦～")
         cnt.setObjectName("count")
         head.addWidget(cnt)
         hw = QWidget()
@@ -330,6 +333,12 @@ class Pet(QWidget):
         self._jump = 0.0         # 当前跳动偏移（衰减振荡）
         self._blinking = False
 
+        # 沙漏动画：悬停触发一次「漏沙 → 翻转」，鼠标移开复位。
+        # phase: "idle"→待机满上舱；"drain"→上舱漏到下舱；"flip"→整体翻180°；"done"→停住
+        self._hg_phase = "idle"
+        self._hg_t = 0.0         # 当前阶段已进行时间（秒）
+        self._hg_flip = 0.0      # 沙漏翻转角度进度 0→1（1=已翻180°）
+
         self._anim = QTimer(self)
         self._anim.timeout.connect(self._tick)
         self._anim.start(33)     # ~30fps
@@ -382,6 +391,8 @@ class Pet(QWidget):
         p.setRenderHint(QPainter.Antialiasing, True)
         # 源矩形用整张高分位图；目标矩形是浮点，drawPixmap 内部按 dpr 缩放
         p.drawPixmap(self._pet_rect, pm, QRectF(pm.rect()))
+        # 肚子上的沙漏：运行时绘制，支持悬停后「漏沙 → 翻转」动画
+        self._draw_hourglass(p)
         # 待办计数气泡：画在小人右上角（同层绘制，无子控件 halo）
         if self._badge_count > 0:
             r = self._pet_rect
@@ -398,6 +409,87 @@ class Pet(QWidget):
             p.drawText(QRectF(bx, by, d, d), Qt.AlignCenter, txt)
         p.end()
 
+    def _draw_hourglass(self, p):
+        """在肚子的奶油圆底上画沙漏。按 _hg_phase/_hg_t 呈现漏沙，
+        按 _hg_flip 呈现整体翻转（只翻沙漏，不动身体）。几何比例沿用
+        make_pet.py 里原沙漏在 400×480 画布中的位置。"""
+        r = self._pet_rect
+        # 归一化坐标 → 当前帧像素坐标
+        def X(fx): return r.x() + fx * r.width()
+        def Y(fy): return r.y() + fy * r.height()
+        # 沙漏关键比例（源画布 400×480）
+        gx0, gx1 = 176 / 400, 224 / 400      # 玻璃上沿两端
+        top_y, neck_y, bot_y = 283 / 480, 330 / 480, 377 / 480
+        wood_top0, wood_top1 = 270 / 480, 283 / 480
+        wood_bot0, wood_bot1 = 377 / 480, 390 / 480
+        wx0, wx1 = 168 / 400, 232 / 400      # 木托两端
+        cx = 200 / 400
+
+        WOOD = QColor(176, 132, 80)
+        SAND = QColor(232, 163, 60)
+        GLASS = QColor(251, 243, 226)
+
+        # 漏沙进度 d：0=全在上舱，1=全在下舱
+        if self._hg_phase == "idle":
+            d = 0.0
+        elif self._hg_phase == "drain":
+            d = min(1.0, self._hg_t / HG_DRAIN_DUR)
+        else:                      # flip / done：沙子已全在（翻转前的）下舱
+            d = 1.0
+
+        p.save()
+        p.setRenderHint(QPainter.Antialiasing, True)
+        # 整体翻转：绕沙漏中心旋转 flip*180°。只作用于沙漏。
+        p.translate(X(cx), Y(neck_y))
+        p.rotate(self._hg_flip * 180.0)
+        p.translate(-X(cx), -Y(neck_y))
+
+        def poly(pts):
+            return QPolygonF([QPointF(X(a), Y(b)) for a, b in pts])
+
+        # 玻璃两个锥体（上下对称，尖端在 neck）
+        upper = poly([(gx0, top_y), (gx1, top_y), (cx, neck_y)])
+        lower = poly([(cx, neck_y), (gx0, bot_y), (gx1, bot_y)])
+        p.setPen(QPen(WOOD, max(1.0, r.width() * 0.005)))
+        p.setBrush(QBrush(GLASS))
+        p.drawPolygon(upper)
+        p.drawPolygon(lower)
+
+        # 上舱沙子：随 d 从满到空，顶面下沉、锥体收窄
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(SAND))
+        if d < 1.0:
+            # 顶面从 top_y 附近下降到 neck；用 (1-d) 决定剩余高度
+            rem = 1.0 - d
+            surf_y = top_y + (neck_y - top_y) * (1.0 - rem)
+            half = (gx1 - gx0) / 2.0
+            hw = half * rem            # 顶面半宽随剩余量收窄
+            p.drawPolygon(poly([
+                (cx - hw, surf_y), (cx + hw, surf_y), (cx, neck_y)]))
+        # 下落的一线沙流（仅漏沙途中）
+        if self._hg_phase == "drain" and 0.02 < d < 0.98:
+            p.setPen(QPen(SAND, max(1.0, r.width() * 0.008)))
+            p.drawLine(QPointF(X(cx), Y(neck_y)),
+                       QPointF(X(cx), Y(bot_y - 0.01)))
+            p.setPen(Qt.NoPen)
+        # 下舱沙子：随 d 从空到满，从底部往上堆（下舱是尖朝上的三角）
+        if d > 0.0:
+            surf_y = bot_y + (neck_y - bot_y) * d   # d=1 时堆到 neck
+            half = (gx1 - gx0) / 2.0
+            hw = half * (1.0 - d)                   # 堆得越高，顶面越窄
+            p.drawPolygon(poly([
+                (cx - hw, surf_y), (cx + hw, surf_y),
+                (gx1, bot_y), (gx0, bot_y)]))
+
+        # 木托（画在最上层，翻转时一起转）
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(WOOD))
+        p.drawPolygon(poly([
+            (wx0, wood_top0), (wx1, wood_top0), (wx1, wood_top1), (wx0, wood_top1)]))
+        p.drawPolygon(poly([
+            (wx0, wood_bot0), (wx1, wood_bot0), (wx1, wood_bot1), (wx0, wood_bot1)]))
+        p.restore()
+
     def _tick(self):
         self._t += 0.033
         # 悬停缩放：向目标平滑插值
@@ -407,7 +499,22 @@ class Pet(QWidget):
             self._jump *= 0.82
         else:
             self._jump = 0.0
+        self._advance_hourglass()
         self._layout_pet()
+
+    def _advance_hourglass(self):
+        """推进沙漏动画：drain（漏沙）→ flip（翻转）→ done。"""
+        dt = 0.033
+        if self._hg_phase == "drain":
+            self._hg_t += dt
+            if self._hg_t >= HG_DRAIN_DUR:
+                self._hg_phase = "flip"
+                self._hg_t = 0.0
+        elif self._hg_phase == "flip":
+            self._hg_t += dt
+            self._hg_flip = min(1.0, self._hg_t / HG_FLIP_DUR)
+            if self._hg_t >= HG_FLIP_DUR:
+                self._hg_phase = "done"
 
     def _schedule_blink(self):
         self._blink_timer.start(random.randint(2500, 6000))
@@ -425,10 +532,19 @@ class Pet(QWidget):
 
     def enterEvent(self, e):
         self._scale_target = HOVER_SCALE   # 悬停放大
+        # 悬停触发一次「漏沙 → 翻转」，仅在待机态起步（避免重复触发）
+        if self._hg_phase == "idle":
+            self._hg_phase = "drain"
+            self._hg_t = 0.0
+            self._hg_flip = 0.0
         super().enterEvent(e)
 
     def leaveEvent(self, e):
         self._scale_target = 1.0
+        # 鼠标移开：复位沙漏，下次悬停可再放一次
+        self._hg_phase = "idle"
+        self._hg_t = 0.0
+        self._hg_flip = 0.0
         super().leaveEvent(e)
 
     def _bounce(self):

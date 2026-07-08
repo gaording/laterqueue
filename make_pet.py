@@ -26,15 +26,8 @@ def render(path, blink=False):
     ell(46,298,96,356,fill=BODY,outline=BODYO,width=S(3))
     ell(304,298,354,356,fill=BODY,outline=BODYO,width=S(3))
     ell(58,150,342,446,fill=BODY,outline=BODYO,width=S(5))
+    # 肚子只画空的奶油色圆底；沙漏改由 laterqueue 运行时绘制（支持漏沙+翻转动画）
     ell(133,258,267,400,fill=CREAM)
-    cx=200; neck=330
-    poly([(168,270),(232,270),(232,283),(168,283)],fill=WOOD)
-    poly([(168,377),(232,377),(232,390),(168,390)],fill=WOOD)
-    poly([(176,283),(224,283),(cx,neck)],fill=GLASS,outline=WOOD)
-    poly([(cx,neck),(176,377),(224,377)],fill=GLASS,outline=WOOD)
-    poly([(180,285),(220,285),(208,306),(192,306)],fill=SAND)
-    line([(cx,neck),(cx,372)],SAND,3)
-    poly([(178,377),(222,377),(cx,353)],fill=SAND)
     ell(118,232,150,254,fill=CHEEK)
     ell(250,232,282,254,fill=CHEEK)
     if blink:
