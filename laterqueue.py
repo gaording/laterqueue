@@ -12,6 +12,7 @@
 
 import os
 import sys
+import re
 import json
 import uuid
 import math
@@ -19,7 +20,7 @@ import random
 import shutil
 import traceback
 import subprocess
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from PySide6.QtCore import (
     Qt, QPoint, QPointF, QSize, QTimer, QRectF, QObject, QThread, Signal)
@@ -29,7 +30,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout, QPushButton,
     QMenu, QInputDialog, QScrollArea, QGraphicsDropShadowEffect, QSizePolicy,
-    QFrame, QDialog, QMessageBox, QProgressDialog,
+    QFrame, QDialog, QMessageBox,
 )
 
 
@@ -55,6 +56,8 @@ POLL_SUBPROCESS_TIMEOUT = 120      # subprocess 外层超时（秒），须 > �
 # 偶发一次超时不报红：连续 N 次失败才在面板显示⚠，成功即清零。
 FAIL_ALERT_THRESHOLD = 2
 DISMISSED_KEEP = 500               # dismissed_keys 最多保留条数，防无限增长
+DONE_KEEP_DAYS = 14                # 已完成记录保留天数：超期在加载时清掉，防 queue.json 无限增长
+DONE_SHOW_MAX = 15                 # 「最近完成」区最多列出条数
 LAUNCH_AGENT_LABEL = "com.laterqueue.app"
 LAUNCH_AGENT_PATH = os.path.expanduser(
     f"~/Library/LaunchAgents/{LAUNCH_AGENT_LABEL}.plist")
@@ -83,9 +86,30 @@ def load_items():
     try:
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-            return data if isinstance(data, list) else []
+            if not isinstance(data, list):
+                return []
     except Exception:
         return []
+    return _prune_done(data)
+
+
+def _prune_done(items):
+    """清掉完成超过 DONE_KEEP_DAYS 天的记录，防 queue.json 无限增长。
+    只影响 done 项；pending 永远保留。有删减才回写。"""
+    cutoff = datetime.now() - timedelta(days=DONE_KEEP_DAYS)
+    kept = []
+    for it in items:
+        if it.get("status") == "done":
+            da = it.get("done_at")
+            try:
+                if da and datetime.fromisoformat(da) < cutoff:
+                    continue   # 超期，丢弃
+            except ValueError:
+                pass           # done_at 格式异常就保守保留
+        kept.append(it)
+    if len(kept) != len(items):
+        save_items(kept)
+    return kept
 
 
 def save_items(items):
@@ -167,8 +191,32 @@ def _resolve_joyctl():
     return "joyctl"  # 兜底：让「找不到」的报错可见
 
 
+# 「@我 监控」依赖京东内部 CLI joyctl（读京ME 群消息）。没装时用这个标记
+# 让面板显示友好的安装引导，而不是甩一句看不懂的 Errno 2。
+JOYCTL_MISSING = "JOYCTL_MISSING"
+JOYCTL_INSTALL_CMD = (
+    "npm install -g @jd/joyctl-office --registry=http://registry.m.jd.com")
+
+
+def _joyctl_available():
+    """joyctl 是否真的装了：能在 PATH / 常见路径里找到，才算有。"""
+    if shutil.which("joyctl"):
+        return True
+    return any(os.path.exists(c) for c in
+               ["/opt/homebrew/bin/joyctl", "/usr/local/bin/joyctl",
+                os.path.expanduser("~/.local/bin/joyctl")])
+
+
 def mention_key(group_id, sent_at, sender):
     return f"{group_id}|{sent_at}|{sender}"
+
+
+def _fmt_done_at(iso):
+    """完成时间 ISO 串 → 「MM-DD HH:MM」；解析不了就原样返回。"""
+    try:
+        return datetime.fromisoformat(iso).strftime("%m-%d %H:%M")
+    except (ValueError, TypeError):
+        return iso or ""
 
 
 # =========================== 开机自启 ===========================
@@ -233,6 +281,12 @@ class MentionPoller(QObject):
         new_candidates = []
         updated_since = dict(self.since_map)
         errors = []
+        # joyctl 没装：不逐群试（否则每个群都甩一句 Errno 2），
+        # 直接发一个特殊标记，让面板显示安装引导。
+        if not _joyctl_available():
+            self.found.emit([], updated_since, [JOYCTL_MISSING])
+            self.finished.emit()
+            return
         for gid in self.groups:
             first_run = self.since_map.get(gid) is None
             try:
@@ -266,7 +320,10 @@ class MentionPoller(QObject):
                "--group-id", str(gid), "--from", "others", "--json"]
         since = self.since_map.get(gid)
         if since:
-            cmd += ["--since", since]
+            # 增量拉取也必须带 limit：joyctl 默认只返回约 20-30 条，
+            # 群消息密集时一个轮询周期内的新消息会超出默认窗口，
+            # 靠后的 @我 就被截掉、永远读不到。放大到 200 覆盖 10 分钟高峰。
+            cmd += ["--since", since, "--limit", "200"]
         else:
             cmd += ["--limit", "30"]
 
@@ -277,7 +334,9 @@ class MentionPoller(QObject):
         if proc.returncode != 0:
             raise RuntimeError((proc.stderr or "joyctl 非零退出").strip()[:200])
 
-        data = json.loads(proc.stdout)
+        # strict=False：京ME 消息里可能夹裸控制字符（\x0b 等），
+        # 默认 json.loads 会抛异常导致整轮 @我 全丢，放宽即可。
+        data = json.loads(proc.stdout, strict=False)
         messages = data.get("messages", []) if isinstance(data, dict) else []
         needle = "@" + self.mention_name
         cands, latest = [], since
@@ -298,36 +357,6 @@ class MentionPoller(QObject):
                 "content": content,
             })
         return cands, latest
-
-
-class GroupSearcher(QObject):
-    """一次性 worker：在 worker 线程里跑阻塞的 joyctl 搜群（十几秒），
-    完成后把结果通过信号抛回主线程。keyword 由主线程在启动前注入。"""
-
-    # 搜索结果(list[{id,name}]) + 错误串(空表示成功)
-    done = Signal(list, str)
-
-    def __init__(self):
-        super().__init__()
-        self.joyctl = _resolve_joyctl()
-        self.keyword = ""
-
-    def search(self):
-        cmd = [self.joyctl, "chat", "group", "search",
-               "--search", self.keyword, "--json"]
-        try:
-            proc = subprocess.run(cmd, capture_output=True, text=True,
-                                  timeout=POLL_SUBPROCESS_TIMEOUT)
-            if proc.returncode != 0:
-                raise RuntimeError((proc.stderr or "joyctl 非零退出").strip()[:200])
-            data = json.loads(proc.stdout)
-            groups = data.get("groups", []) if isinstance(data, dict) else []
-            results = [{"id": str(g.get("id")),
-                        "name": g.get("name") or str(g.get("id"))}
-                       for g in groups if g.get("id")]
-            self.done.emit(results, "")
-        except Exception as e:
-            self.done.emit([], str(e)[:200])
 
 
 class QueueBubble(QWidget):
@@ -370,6 +399,15 @@ class QueueBubble(QWidget):
             QPushButton#ignore:hover { color:#8a7f6d; }
             QFrame#divider { background:#ece3d4; max-height:1px; min-height:1px;
                              border:none; }
+            QPushButton#donehead { color:#b0a48f; font-size:12px; font-weight:600;
+                                   text-align:left; padding:2px 0; }
+            QPushButton#donehead:hover { color:#8a7f6d; }
+            QLabel.donetask { color:#b0a48f; font-size:12px; }
+            QLabel.donetime { color:#c4b9a6; font-size:11px; }
+            QLabel#joyctlcmd { color:#5a5347; font-size:11px;
+                               font-family:Menlo,Monaco,monospace;
+                               background:#f0e9db; border-radius:6px;
+                               padding:5px 7px; }
         """)
         shadow = QGraphicsDropShadowEffect(self)
         shadow.setBlurRadius(28)
@@ -384,6 +422,8 @@ class QueueBubble(QWidget):
         self.vbox = QVBoxLayout(self.card)
         self.vbox.setContentsMargins(16, 14, 16, 16)
         self.vbox.setSpacing(8)
+
+        self._show_done = False   # 「最近完成」区默认收起
 
         self.refresh()
 
@@ -455,12 +495,52 @@ class QueueBubble(QWidget):
         aw.setLayout(addw)
         self.vbox.addWidget(aw)
 
+        # 「最近完成」折叠区：完成的事没删只是不显示，这里给个回顾入口。
+        # 默认收起，点标题展开；只列最近若干条，旧的加载时已自动过期。
+        done = self.app.done_recent()
+        if done:
+            div = QFrame()
+            div.setObjectName("divider")
+            self.vbox.addWidget(div)
+
+            arrow = "▾" if self._show_done else "▸"
+            head = QPushButton(f"{arrow} 最近完成 {len(done)}")
+            head.setObjectName("donehead")
+            head.setCursor(Qt.PointingHandCursor)
+            head.clicked.connect(self._toggle_done)
+            self.vbox.addWidget(head)
+
+            if self._show_done:
+                for it in done:
+                    self.vbox.addWidget(self._done_row(it))
+
         # 轮询状态行：连续多次失败才醒目提示（打包成 .app 后 stderr 不可见，
         # 全靠这里让用户知道「@我 检查失败了」，比如京ME 登录态失效）。
         # 偶发一次超时不亮红，退回显示淡色「上次检查」，不打扰。
         if self.app.monitor_group_ids():
             st = self.app.poll_status()
-            if st and st.get("alert"):
+            if st and st.get("joyctl_missing"):
+                # 没装 joyctl：给友好的安装引导，而不是甩 Errno 2。
+                tip = QLabel("⚠ 需要先装 joyctl 才能监控 @我：")
+                tip.setObjectName("pollbad")
+                tip.setWordWrap(True)
+                tip.setMaximumWidth(300)
+                self.vbox.addWidget(tip)
+
+                cmd = QLabel(JOYCTL_INSTALL_CMD)
+                cmd.setObjectName("joyctlcmd")
+                cmd.setWordWrap(True)
+                cmd.setMaximumWidth(300)
+                cmd.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                cmd.setToolTip("在终端运行这条命令（可选中复制）")
+                self.vbox.addWidget(cmd)
+
+                note = QLabel("装完还要在终端登录一次京ME。")
+                note.setObjectName("pollok")
+                note.setWordWrap(True)
+                note.setMaximumWidth(300)
+                self.vbox.addWidget(note)
+            elif st and st.get("alert"):
                 warn = QLabel(f"⚠ 检查失败（{st.get('at', '')}）：{st.get('error', '')}")
                 warn.setObjectName("pollbad")
                 warn.setWordWrap(True)
@@ -473,6 +553,32 @@ class QueueBubble(QWidget):
 
         self.card.adjustSize()
         self.adjustSize()
+
+    def _toggle_done(self):
+        self._show_done = not self._show_done
+        self.refresh()
+
+    def _done_row(self, it):
+        """一条已完成记录：淡色文本 + 完成时间。只读，不带操作按钮。"""
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        row.setContentsMargins(4, 0, 0, 0)
+
+        lbl = QLabel(it.get("text", ""))
+        lbl.setProperty("class", "donetask")
+        lbl.setMinimumWidth(180)
+        lbl.setMaximumWidth(220)
+        lbl.setWordWrap(False)
+        row.addWidget(lbl, 1)
+
+        when = _fmt_done_at(it.get("done_at", ""))
+        ts = QLabel(when)
+        ts.setProperty("class", "donetime")
+        row.addWidget(ts)
+
+        w = QWidget()
+        w.setLayout(row)
+        return w
 
     def _row(self, it):
         row = QHBoxLayout()
@@ -549,7 +655,7 @@ class QueueBubble(QWidget):
 
 class GroupManagerDialog(QDialog):
     """管理监控群：查看/添加/删除群，以及设置 @我 检测姓名。
-    加群走 app.add_group_via_search（异步搜 joyctl），删群清游标。"""
+    加群走 app.add_group_manually（直接填群号），删群清游标。"""
 
     def __init__(self, app):
         super().__init__()
@@ -608,7 +714,7 @@ class GroupManagerDialog(QDialog):
         # 群列表
         groups = self.app.monitor_groups()
         if not groups:
-            hint = QLabel("还没加群，点下面「搜索添加群」")
+            hint = QLabel("还没加群，点下面「添加群」")
             hint.setObjectName("hint")
             self.vbox.addWidget(hint)
         else:
@@ -628,7 +734,7 @@ class GroupManagerDialog(QDialog):
 
         # 底部按钮
         btns = QHBoxLayout()
-        add = QPushButton("＋ 搜索添加群")
+        add = QPushButton("＋ 添加群")
         add.setObjectName("add")
         add.clicked.connect(self._on_add)
         btns.addWidget(add)
@@ -651,8 +757,8 @@ class GroupManagerDialog(QDialog):
             self._reload()
 
     def _on_add(self):
-        # 异步搜群；成功加群后回调里刷新本弹窗
-        self.app.add_group_via_search(parent=self, on_added=self._reload)
+        # 直接填群号加群；成功后回调里刷新本弹窗
+        self.app.add_group_manually(parent=self, on_added=self._reload)
 
     def _on_remove(self, gid):
         groups = [g for g in self.app.monitor_groups() if g.get("id") != gid]
@@ -755,9 +861,6 @@ class Pet(QWidget):
         # poller 在独立 QThread 里跑阻塞的 joyctl（约 14 秒），完成后用信号回主线程。
         self._poll_thread = None
         self._poller = None
-        # 搜群 worker 的线程/对象引用（同样必须持有，否则方法返回即被 GC）
-        self._search_thread = None
-        self._searcher = None
         self._poll_timer = QTimer(self)
         self._poll_timer.timeout.connect(self._start_poll)
         # 永远起定时器+排首轮：没配群时 _start_poll 会早退，零浪费；
@@ -998,6 +1101,12 @@ class Pet(QWidget):
     def pending(self):
         return [it for it in self.items if it["status"] == "pending"]
 
+    def done_recent(self):
+        """已完成项，按完成时间倒序（最近的在前），最多 DONE_SHOW_MAX 条。"""
+        dl = [it for it in self.items if it.get("status") == "done"]
+        dl.sort(key=lambda it: it.get("done_at", ""), reverse=True)
+        return dl[:DONE_SHOW_MAX]
+
     def add_via_dialog(self):
         text, ok = QInputDialog.getText(
             self, "晚点队列", "要晚点处理的事（回车加入队列顶部）：")
@@ -1132,7 +1241,14 @@ class Pet(QWidget):
         # 记录本轮轮询结果，供面板/菜单显示（打包成 .app 后看不到 stderr）
         now = datetime.now().strftime("%m-%d %H:%M")
         prev = self.mentions.get("poll_status", {})
-        if errors:
+        if errors == [JOYCTL_MISSING]:
+            # joyctl 没装：确定性问题，不走「连续失败才报警」的阈值，
+            # 立即在面板显示安装引导。
+            self.mentions["poll_status"] = {
+                "ok": False, "at": now, "error": "",
+                "joyctl_missing": True,
+                "fail_count": 0, "alert": True}
+        elif errors:
             # 累计连续失败次数；达到阈值才在面板亮红，避免偶发一次超时就报警
             fail_count = int(prev.get("fail_count", 0)) + 1
             self.mentions["poll_status"] = {
@@ -1158,74 +1274,37 @@ class Pet(QWidget):
         self.update_badge()
         self.refresh_ui()
 
-    def add_group_via_search(self, parent=None, on_added=None):
-        """搜索并添加监控群：输入关键词 → 后台线程跑 joyctl 搜群（十几秒）
-        → 结果列给用户选 → 选中的加入 monitor_groups。on_added 在成功加群后
-        回调（GroupManagerDialog 用它刷新自身列表）。"""
-        if self._search_thread is not None:   # 上一次搜索还在跑
-            QMessageBox.information(parent, "请稍候", "正在搜索上一批群，稍等一下。")
-            return
-        keyword, ok = QInputDialog.getText(
-            parent, "搜索群", "输入群名称关键词（可用逗号分隔多个）：")
-        if not ok or not keyword.strip():
+    def add_group_manually(self, parent=None, on_added=None):
+        """直接填群号加监控群：输入群号（可逗号/空格/换行分隔多个）→ 逐个
+        写入 monitor_groups。不走 joyctl 搜索，无阻塞、无卡死。列表里群名
+        直接显示群号。on_added 在加群后回调。"""
+        text, ok = QInputDialog.getText(
+            parent, "添加监控群",
+            "输入群号（可用逗号、空格或换行分隔多个）：")
+        if not ok or not text.strip():
             return
 
-        # 搜群是阻塞的（十几秒），丢后台线程，弹个不确定进度框安抚用户
-        prog = QProgressDialog("正在搜索京ME 群…", "取消", 0, 0, parent)
-        prog.setWindowTitle("搜索群")
-        prog.setMinimumDuration(0)
-        prog.setValue(0)
-
-        thread = QThread(self)
-        searcher = GroupSearcher()
-        searcher.keyword = keyword.strip()
-        searcher.moveToThread(thread)
-        thread.started.connect(searcher.search)
-        searcher.done.connect(
-            lambda results, err: self._on_group_search_done(
-                results, err, parent, on_added, prog))
-        searcher.done.connect(thread.quit)
-        thread.finished.connect(searcher.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(self._on_search_finished)
-        # 取消：只关进度框；后台线程跑完会自行收尾（joyctl 无法中途打断）
-        prog.canceled.connect(prog.close)
-        # 持有引用，防 GC（同 _start_poll 的道理）
-        self._search_thread = thread
-        self._searcher = searcher
-        thread.start()
-
-    def _on_search_finished(self):
-        self._search_thread = None
-        self._searcher = None
-
-    def _on_group_search_done(self, results, err, parent, on_added, prog):
-        # 全程主线程：关进度框 + 弹结果供选择 + 写配置
-        if prog is not None:
-            prog.close()
-        if err:
-            QMessageBox.warning(parent, "搜索失败", f"joyctl 搜群出错：\n{err}")
-            return
-        if not results:
-            QMessageBox.information(parent, "没有结果", "没搜到匹配的群，换个关键词试试。")
+        # 拆出所有群号：逗号/空格/换行/中文逗号都当分隔符
+        raw = re.split(r"[,\s，]+", text.strip())
+        ids = [x.strip() for x in raw if x.strip()]
+        if not ids:
             return
 
-        # 已监控的群不再重复列出
         existing = set(self.monitor_group_ids())
-        choices = [g for g in results if g.get("id") not in existing]
-        if not choices:
-            QMessageBox.information(parent, "已在监控", "搜到的群都已在监控列表里了。")
+        groups = self.monitor_groups()
+        added = 0
+        for gid in ids:
+            if gid in existing:
+                continue
+            # 群名先用群号占位
+            groups.append({"id": gid, "name": gid})
+            existing.add(gid)
+            added += 1
+
+        if added == 0:
+            QMessageBox.information(parent, "已在监控", "填的群号都已经在监控列表里了。")
             return
 
-        labels = [f"{g['name']}（{g['id']}）" for g in choices]
-        pick, ok = QInputDialog.getItem(
-            parent, "选择要监控的群", "选中一个群加入监控：",
-            labels, 0, False)
-        if not ok or not pick:
-            return
-        chosen = choices[labels.index(pick)]
-        groups = self.monitor_groups()
-        groups.append({"id": chosen["id"], "name": chosen["name"]})
         self.mentions["monitor_groups"] = groups
         save_mentions(self.mentions)
         self.update_badge()
