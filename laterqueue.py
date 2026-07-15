@@ -18,6 +18,7 @@ import uuid
 import math
 import random
 import shutil
+import glob
 import traceback
 import subprocess
 from datetime import datetime, timedelta
@@ -47,7 +48,9 @@ MENTIONS_FILE = os.path.join(DATA_DIR, "mentions.json")
 # 监控群与检测姓名现在都存在 mentions.json，可在「管理监控群」里增删/修改；
 # 下面的 MENTION_NAME 仅作为 mention_name 的初始默认值。
 MENTION_NAME = "高润丁"             # @我 检测姓名的默认值（首次运行用）
-POLL_INTERVAL_MS = 10 * 60 * 1000  # 轮询间隔：10 分钟
+POLL_INTERVAL_MS = 10 * 60 * 1000  # 轮询间隔默认值：10 分钟（可在菜单自定义）
+POLL_INTERVAL_MIN = 1              # 自定义间隔下限（分钟）：太短会频繁调 joyctl
+POLL_INTERVAL_MAX = 120            # 自定义间隔上限（分钟）
 POLL_FIRST_DELAY_MS = 3000         # 启动后首轮延迟，避免拖慢启动
 # joyctl 读群消息本来就慢（十几秒起，赶上消息多/网络慢更久）。
 # 内部超时给到 90s，subprocess 外层再多 30s 缓冲，避免正常慢查询被误判超时。
@@ -179,16 +182,41 @@ def save_mentions(m):
     os.replace(tmp, MENTIONS_FILE)
 
 
+def _joyctl_candidates():
+    """列出 joyctl 可能所在的路径。打包成 .app 后经 Finder 启动，PATH 被砍到
+    只剩 /usr/bin:/bin:/usr/sbin:/sbin，node/npm 的 bin 目录全都不在里面，
+    shutil.which 因此找不到。joyctl 是 npm 全局包，可能装在 homebrew、系统 npm、
+    或 nvm/fnm/volta 管理的 node 里，这里把这些常见位置都枚举出来。"""
+    home = os.path.expanduser("~")
+    fixed = [
+        "/opt/homebrew/bin/joyctl",        # homebrew (Apple Silicon)
+        "/usr/local/bin/joyctl",           # homebrew (Intel) / 系统 npm
+        os.path.join(home, ".local/bin/joyctl"),
+        os.path.join(home, ".volta/bin/joyctl"),
+        os.path.join(home, "Library/pnpm/joyctl"),
+        "/opt/homebrew/lib/node_modules/@jd/joyctl-office/dist/main-office.js",
+    ]
+    # nvm / fnm 每个 node 版本一个 bin 目录，用 glob 展开
+    globbed = []
+    for pat in [
+        os.path.join(home, ".nvm/versions/node/*/bin/joyctl"),
+        os.path.join(home, ".fnm/node-versions/*/installation/bin/joyctl"),
+        os.path.join(home, "Library/Application Support/fnm/node-versions/*/installation/bin/joyctl"),
+        os.path.join(home, "n/bin/joyctl"),
+    ]:
+        globbed += glob.glob(pat)
+    return fixed + sorted(globbed, reverse=True)   # nvm 多版本时优先较新的
+
+
 def _resolve_joyctl():
-    """打包成 .app 后子进程 PATH 可能缺失，需回退到绝对路径。"""
+    """返回可执行的 joyctl 路径；找不到就兜底返回 'joyctl' 让报错可见。"""
     p = shutil.which("joyctl")
     if p:
         return p
-    for c in ["/opt/homebrew/bin/joyctl", "/usr/local/bin/joyctl",
-              os.path.expanduser("~/.local/bin/joyctl")]:
+    for c in _joyctl_candidates():
         if os.path.exists(c):
             return c
-    return "joyctl"  # 兜底：让「找不到」的报错可见
+    return "joyctl"
 
 
 # 「@我 监控」依赖京东内部 CLI joyctl（读京ME 群消息）。没装时用这个标记
@@ -199,12 +227,10 @@ JOYCTL_INSTALL_CMD = (
 
 
 def _joyctl_available():
-    """joyctl 是否真的装了：能在 PATH / 常见路径里找到，才算有。"""
+    """joyctl 是否真的装了。与 _resolve_joyctl 共用候选列表，避免两处逻辑漂移。"""
     if shutil.which("joyctl"):
         return True
-    return any(os.path.exists(c) for c in
-               ["/opt/homebrew/bin/joyctl", "/usr/local/bin/joyctl",
-                os.path.expanduser("~/.local/bin/joyctl")])
+    return any(os.path.exists(c) for c in _joyctl_candidates())
 
 
 def mention_key(group_id, sent_at, sender):
@@ -519,7 +545,12 @@ class QueueBubble(QWidget):
         # 偶发一次超时不亮红，退回显示淡色「上次检查」，不打扰。
         if self.app.monitor_group_ids():
             st = self.app.poll_status()
-            if st and st.get("joyctl_missing"):
+            if getattr(self.app, "_checking", False):
+                # 用户点了「立即检查」：立刻显示，别让人以为没反应（joyctl 约十几秒）
+                chk = QLabel("正在检查 @我…")
+                chk.setObjectName("pollok")
+                self.vbox.addWidget(chk)
+            elif st and st.get("joyctl_missing"):
                 # 没装 joyctl：给友好的安装引导，而不是甩 Errno 2。
                 tip = QLabel("⚠ 需要先装 joyctl 才能监控 @我：")
                 tip.setObjectName("pollbad")
@@ -861,12 +892,15 @@ class Pet(QWidget):
         # poller 在独立 QThread 里跑阻塞的 joyctl（约 14 秒），完成后用信号回主线程。
         self._poll_thread = None
         self._poller = None
+        self._checking = False   # 「立即检查」进行中标志，供面板显示「检查中…」
         self._poll_timer = QTimer(self)
-        self._poll_timer.timeout.connect(self._start_poll)
+        # 注意：QTimer.timeout 会给槽传一个 bool，会污染 _start_poll(manual)，
+        # 故用 lambda 显式调用，确保定时轮询走 manual=False。
+        self._poll_timer.timeout.connect(lambda: self._start_poll())
         # 永远起定时器+排首轮：没配群时 _start_poll 会早退，零浪费；
         # 用户后来加了第一个群，下个 tick 自动开始轮询，不用重启。
-        self._poll_timer.start(POLL_INTERVAL_MS)
-        QTimer.singleShot(POLL_FIRST_DELAY_MS, self._start_poll)
+        self._poll_timer.start(self.poll_interval_min() * 60 * 1000)
+        QTimer.singleShot(POLL_FIRST_DELAY_MS, lambda: self._start_poll())
 
     # ---------- 动画 ----------
     def _load_pet_pixmap(self, path, dpr):
@@ -1065,6 +1099,11 @@ class Pet(QWidget):
         """点击/新增任务时跳一下。"""
         self._jump = JUMP_AMP
 
+    def _toast(self, text):
+        """在小精灵附近弹个短提示（用系统 tooltip，自动消失，零布局成本）。"""
+        from PySide6.QtWidgets import QToolTip
+        QToolTip.showText(self.frameGeometry().center(), text, self)
+
     # ---------- 菜单 ----------
     def _build_menu(self):
         m = QMenu(self)
@@ -1082,8 +1121,11 @@ class Pet(QWidget):
         a_groups.triggered.connect(self.open_group_manager)
         m.addAction(a_groups)
         a_check = QAction("立即检查 @我", self)
-        a_check.triggered.connect(self._start_poll)
+        a_check.triggered.connect(lambda: self._start_poll(manual=True))
         m.addAction(a_check)
+        a_interval = QAction(f"检查频率：{self.poll_interval_min()} 分钟…", self)
+        a_interval.triggered.connect(self._edit_interval)
+        m.addAction(a_interval)
         a_clear = QAction("清除已完成记录", self)
         a_clear.triggered.connect(self.clear_done)
         m.addAction(a_clear)
@@ -1162,6 +1204,14 @@ class Pet(QWidget):
     def mention_name(self):
         return self.mentions.get("mention_name") or MENTION_NAME
 
+    def poll_interval_min(self):
+        """轮询间隔（分钟）：读配置，缺省 10，钳在 [MIN, MAX] 内。"""
+        try:
+            v = int(self.mentions.get("poll_interval_min", 10))
+        except (TypeError, ValueError):
+            v = 10
+        return max(POLL_INTERVAL_MIN, min(v, POLL_INTERVAL_MAX))
+
     def _dismiss_key(self, key):
         """记入 dismissed_keys（去重 + 截断），下次轮询不再拉回。"""
         dk = self.mentions.setdefault("dismissed_keys", [])
@@ -1202,11 +1252,21 @@ class Pet(QWidget):
         return t if len(t) <= n else t[:n] + "…"
 
     # ---------- 被@轮询 ----------
-    def _start_poll(self):
-        if self._poll_thread is not None:   # 上一轮还在跑，跳过本次
+    def _start_poll(self, manual=False):
+        """轮询被@。manual=True 表示用户点了「立即检查」，需要即时反馈：
+        正忙就提示、否则立刻在面板显示「检查中…」，别让用户以为没反应。"""
+        if self._poll_thread is not None:   # 上一轮还在跑
+            if manual:
+                self._checking = True       # 复用「检查中」提示，点击有反馈
+                self.refresh_ui()
             return
         if not self.monitor_group_ids():    # 没配群，无事可做
+            if manual:
+                self._toast("还没加监控群，先去「管理监控群」加一个")
             return
+        if manual:
+            self._checking = True           # 面板显示「检查中…」
+            self.refresh_ui()
         thread = QThread(self)
         poller = MentionPoller()
         poller.since_map = dict(self.mentions.get("last_since", {}))
@@ -1232,6 +1292,8 @@ class Pet(QWidget):
     def _on_poll_finished(self):
         self._poll_thread = None
         self._poller = None
+        self._checking = False   # 清「检查中…」
+        self.refresh_ui()
 
     def _on_mentions_found(self, new_candidates, updated_since, errors):
         # 全部在主线程：写文件 + 刷 UI
@@ -1273,6 +1335,21 @@ class Pet(QWidget):
         dlg.exec()
         self.update_badge()
         self.refresh_ui()
+
+    def _edit_interval(self):
+        """自定义检查频率（分钟）：写入配置并立刻重启定时器生效。"""
+        cur = self.poll_interval_min()
+        val, ok = QInputDialog.getInt(
+            self, "检查频率",
+            f"每隔多少分钟检查一次 @我（{POLL_INTERVAL_MIN}–{POLL_INTERVAL_MAX}）：",
+            cur, POLL_INTERVAL_MIN, POLL_INTERVAL_MAX)
+        if not ok:
+            return
+        self.mentions["poll_interval_min"] = val
+        save_mentions(self.mentions)
+        # 立刻重启定时器，新间隔当场生效，不用重启 app
+        self._poll_timer.start(val * 60 * 1000)
+        self._toast(f"已设为每 {val} 分钟检查一次")
 
     def add_group_manually(self, parent=None, on_added=None):
         """直接填群号加监控群：输入群号（可逗号/空格/换行分隔多个）→ 逐个
@@ -1418,7 +1495,32 @@ class Pet(QWidget):
             self.a_launch.setChecked(False)
 
 
+def _augment_path():
+    """把常见的 node/npm bin 目录补进 PATH。打包成 .app 经 Finder 启动时，
+    PATH 被砍到只剩系统目录，joyctl 和它依赖的 node 都不在里面。这里主动补齐，
+    让 shutil.which 和 joyctl 子进程（node 脚本，运行时还要找 node）都能工作。"""
+    home = os.path.expanduser("~")
+    extra = [
+        "/opt/homebrew/bin", "/usr/local/bin",
+        os.path.join(home, ".local/bin"),
+        os.path.join(home, ".volta/bin"),
+        os.path.join(home, "Library/pnpm"),
+    ]
+    for pat in [
+        os.path.join(home, ".nvm/versions/node/*/bin"),
+        os.path.join(home, ".fnm/node-versions/*/installation/bin"),
+        os.path.join(home, "Library/Application Support/fnm/node-versions/*/installation/bin"),
+    ]:
+        extra += sorted(glob.glob(pat), reverse=True)
+    cur = os.environ.get("PATH", "").split(os.pathsep)
+    seen = set(cur)
+    add = [d for d in extra if d not in seen and os.path.isdir(d)]
+    if add:
+        os.environ["PATH"] = os.pathsep.join(cur + add)
+
+
 def main():
+    _augment_path()   # 先补 PATH，joyctl 检测/调用才靠谱（尤其打包成 .app 后）
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)   # 隐藏气泡不退出
 
